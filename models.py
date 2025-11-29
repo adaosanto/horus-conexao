@@ -1,16 +1,19 @@
-from typing import Optional, List
-from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import List, Optional
+
+from pydantic import BaseModel, Field
 
 
 class IngestRequest(BaseModel):
     """Payload recebido no endpoint /ingest"""
+
     gw: Optional[str] = Field(default="unknown", description="Gateway ID")
     adv: List[dict] = Field(default_factory=list, description="Lista de anúncios BLE")
 
 
 class TagReading(BaseModel):
     """Leitura individual de uma tag"""
+
     mac: str
     rssi: int
     tm: Optional[int] = None
@@ -18,6 +21,7 @@ class TagReading(BaseModel):
 
 class TagData(BaseModel):
     """Dados atuais de uma tag"""
+
     mac: str
     last_rssi: int
     last_seen: int
@@ -26,6 +30,7 @@ class TagData(BaseModel):
 
 class TagStatsResponse(BaseModel):
     """Resposta do endpoint /stats"""
+
     mac: str
     last_rssi: int
     gateway: str
@@ -36,6 +41,7 @@ class TagStatsResponse(BaseModel):
 
 class TagHistoryEntry(BaseModel):
     """Entrada do histórico de uma tag"""
+
     timestamp: int
     rssi: int
     gateway: str
@@ -43,6 +49,7 @@ class TagHistoryEntry(BaseModel):
 
 class TagHistoryResponse(BaseModel):
     """Resposta do endpoint /history/{mac}"""
+
     mac: str
     entries: List[TagHistoryEntry]
     total: int
