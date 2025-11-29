@@ -1,15 +1,17 @@
 """API FastAPI para gerenciamento de tags BLE/MQTT"""
 
+import hashlib
+import math
 import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from database import TagModel, get_session_dependency
+from database import GatewayModel, TagModel, get_session_dependency
 from models import (IngestRequest, TagHistoryEntry, TagHistoryResponse,
                     TagStatsResponse)
 
@@ -33,6 +35,39 @@ def humanize_datetime(dt: datetime) -> str:
         return f"há {days} dia{'s' if days != 1 else ''}"
     else:
         return dt.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def calculate_tag_position(
+    gateway_lat: float, gateway_lon: float, tag_mac: str, tag_index: int
+) -> Tuple[float, float]:
+    """
+    Calcula posição da tag próxima ao gateway (1-3 metros de distância).
+    Usa hash do MAC para distribuir tags em círculo ao redor do gateway.
+    """
+    # Gera um número determinístico baseado no MAC
+    mac_hash = int(hashlib.md5(tag_mac.encode()).hexdigest(), 16)
+    
+    # Distância em metros (1 a 3 metros)
+    # Usa o hash para determinar a distância de forma determinística
+    distance_meters = 1.0 + (mac_hash % 200) / 100.0  # 1.0 a 3.0 metros
+    
+    # Ângulo em radianos (distribui em círculo completo)
+    # Usa tag_index para evitar sobreposição de tags do mesmo gateway
+    angle_rad = (mac_hash % 360) * (math.pi / 180.0) + (tag_index * 0.5)
+    
+    # Raio da Terra em metros
+    earth_radius = 6371000
+    
+    # Converte distância em metros para graus
+    # 1 grau de latitude ≈ 111 km
+    # 1 grau de longitude ≈ 111 km * cos(latitude)
+    lat_offset = (distance_meters / 111000) * math.cos(angle_rad)
+    lon_offset = (distance_meters / (111000 * math.cos(math.radians(gateway_lat)))) * math.sin(angle_rad)
+    
+    tag_lat = gateway_lat + lat_offset
+    tag_lon = gateway_lon + lon_offset
+    
+    return tag_lat, tag_lon
 
 
 router = APIRouter()
@@ -87,25 +122,59 @@ async def list_all_stats(db: AsyncSession = Depends(get_session_dependency)):
     now = datetime.now()
     threshold = now - timedelta(seconds=10)
 
-    # Busca a última entrada de cada MAC
+    # Busca a última entrada de cada MAC com join no gateway
     subquery = (
         select(TagModel.mac, func.max(TagModel.timestamp).label("max_timestamp"))
         .group_by(TagModel.mac)
         .subquery()
     )
 
-    query = select(TagModel).join(
-        subquery,
-        (TagModel.mac == subquery.c.mac)
-        & (TagModel.timestamp == subquery.c.max_timestamp),
+    query = (
+        select(TagModel, GatewayModel)
+        .outerjoin(
+            GatewayModel, TagModel.gateway_mac == GatewayModel.mac
+        )
+        .join(
+            subquery,
+            (TagModel.mac == subquery.c.mac)
+            & (TagModel.timestamp == subquery.c.max_timestamp),
+        )
     )
 
     result = await db.execute(query)
-    tags = result.scalars().all()
+    rows = result.all()
 
+    # Agrupa tags por gateway para calcular índices
+    gateway_tag_counts = {}
     stats = []
-    for tag in tags:
+    
+    for row in rows:
+        tag, gateway = row
         presence = "present" if tag.timestamp >= threshold else "absent"
+        
+        # Calcula coordenadas se o gateway tiver geolocation
+        tag_lat = None
+        tag_lon = None
+        
+        if gateway and gateway.geolocation:
+            geoloc = gateway.geolocation
+            if isinstance(geoloc, dict):
+                gateway_lat = geoloc.get("latitude")
+                gateway_lon = geoloc.get("longitude")
+                
+                if gateway_lat is not None and gateway_lon is not None:
+                    # Conta quantas tags já foram processadas para este gateway
+                    gateway_key = tag.gateway_mac or "unknown"
+                    if gateway_key not in gateway_tag_counts:
+                        gateway_tag_counts[gateway_key] = 0
+                    tag_index = gateway_tag_counts[gateway_key]
+                    gateway_tag_counts[gateway_key] += 1
+                    
+                    # Calcula posição da tag próxima ao gateway
+                    tag_lat, tag_lon = calculate_tag_position(
+                        gateway_lat, gateway_lon, tag.mac, tag_index
+                    )
+        
         stats.append(
             TagStatsResponse(
                 mac=tag.mac,
@@ -114,6 +183,8 @@ async def list_all_stats(db: AsyncSession = Depends(get_session_dependency)):
                 last_seen=int(tag.timestamp.timestamp()),
                 last_seen_humanized=humanize_datetime(tag.timestamp),
                 presence=presence,
+                latitude=tag_lat,
+                longitude=tag_lon,
             )
         )
 
@@ -125,23 +196,42 @@ async def get_stats(mac: str, db: AsyncSession = Depends(get_session_dependency)
     """Retorna dados mais recentes de uma tag específica"""
     mac = mac.lower()
 
-    # Busca a última entrada deste MAC
+    # Busca a última entrada deste MAC com join no gateway
     query = (
-        select(TagModel)
+        select(TagModel, GatewayModel)
+        .outerjoin(GatewayModel, TagModel.gateway_mac == GatewayModel.mac)
         .where(TagModel.mac == mac)
         .order_by(desc(TagModel.timestamp))
         .limit(1)
     )
 
     result = await db.execute(query)
-    tag = result.scalar_one_or_none()
+    row = result.first()
 
-    if not tag:
+    if not row:
         raise HTTPException(status_code=404, detail="MAC não encontrado")
+
+    tag, gateway = row
 
     now = datetime.now()
     threshold = now - timedelta(seconds=10)
     presence = "present" if tag.timestamp >= threshold else "absent"
+
+    # Calcula coordenadas se o gateway tiver geolocation
+    tag_lat = None
+    tag_lon = None
+
+    if gateway and gateway.geolocation:
+        geoloc = gateway.geolocation
+        if isinstance(geoloc, dict):
+            gateway_lat = geoloc.get("latitude")
+            gateway_lon = geoloc.get("longitude")
+
+            if gateway_lat is not None and gateway_lon is not None:
+                # Para uma única tag, usa índice 0
+                tag_lat, tag_lon = calculate_tag_position(
+                    gateway_lat, gateway_lon, tag.mac, 0
+                )
 
     return TagStatsResponse(
         mac=tag.mac,
@@ -150,6 +240,8 @@ async def get_stats(mac: str, db: AsyncSession = Depends(get_session_dependency)
         last_seen=int(tag.timestamp.timestamp()),
         last_seen_humanized=humanize_datetime(tag.timestamp),
         presence=presence,
+        latitude=tag_lat,
+        longitude=tag_lon,
     )
 
 

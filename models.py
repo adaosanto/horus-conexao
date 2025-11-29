@@ -37,6 +37,8 @@ class TagStatsResponse(BaseModel):
     last_seen: int
     last_seen_humanized: str = Field(description="Data formatada de forma humanizada")
     presence: str
+    latitude: Optional[float] = Field(default=None, description="Latitude da tag (próxima ao gateway)")
+    longitude: Optional[float] = Field(default=None, description="Longitude da tag (próxima ao gateway)")
 
 
 class TagHistoryEntry(BaseModel):
