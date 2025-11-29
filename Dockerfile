@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN pip install uv
+
+COPY . .
+
+RUN uv sync
+
+CMD ["uv", "run", "fastapi", "dev", "checkgis/app.py"]
